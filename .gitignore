@@ -1,0 +1,35 @@
+# Terraform files
+.terraform
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Sensitive files
+secrets.tfvars
+*.pem
+*.key
+*.pub
+playbooks
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Workspace files
+.terraform/
+terraform.tfvars.json
+.terraformrc
+terraform.rc
+
+# Ignore override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# But allow the example file
+!*.tfvars.example

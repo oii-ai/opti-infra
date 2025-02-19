@@ -1,117 +1,222 @@
-# create the app server instance which is a large box with enough compute
-# and attach a separate storage for storing RDS items in there
-resource "aws_instance" "app_server" {
-  ami                    = local.default_ami
-  subnet_id              = module.networking.private_subnet_id[0]
-  key_name               = aws_key_pair.internal_key_pair.key_name
-  availability_zone      = module.networking.private_subnets[0].availability_zone
-  vpc_security_group_ids = [aws_security_group.appserver_sg.id]
-  instance_type          = "t4g.2xlarge"
+# =============================================================================
+# Application Server Configuration
+# Purpose: Deploys the main application server with associated storage and networking
+# =============================================================================
 
-  root_block_device {
-    volume_size = 50
-    tags = {
-      Name = "${local.prefix}-app_server-root-ebs"
-    }
-    delete_on_termination = true
+# -----------------------------------------------------------------------------
+# Network Security Group
+# Defines security rules for the application server
+# -----------------------------------------------------------------------------
+resource "azurerm_network_security_group" "appserver_nsg" {
+  name                = "${local.prefix}-appserver-nsg"
+  location            = module.networking.resource_group_location
+  resource_group_name = module.networking.resource_group_name
+
+  # Allow HTTPS inbound
+  security_rule {
+    name                       = "AllowHTTPS"
+    priority                   = 1001
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range         = "*"
+    destination_port_range    = "443"
+    source_address_prefix     = "*"
+    destination_address_prefix = "*"
   }
+
+  # Allow internal communication
+  security_rule {
+    name                       = "AllowInternalAll"
+    priority                   = 1002
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range         = "*"
+    destination_port_range    = "*"
+    source_address_prefix     = "VirtualNetwork"
+    destination_address_prefix = "VirtualNetwork"
+  }
+
+  tags = {
+    Name = "${local.prefix}-appserver-nsg"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Network Interface
+# Creates the primary network interface for the app server
+# -----------------------------------------------------------------------------
+resource "azurerm_network_interface" "app_server_nic" {
+  name                = "${local.prefix}-appserver-nic"
+  location            = module.networking.resource_group_location
+  resource_group_name = module.networking.resource_group_name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = module.networking.vm_subnet_id["1"]  # Using first AZ
+    private_ip_address_allocation = "Dynamic"
+  }
+
+  tags = {
+    Name = "${local.prefix}-appserver-nic"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Network Security Group Association
+# Links the NSG to the network interface
+# -----------------------------------------------------------------------------
+resource "azurerm_network_interface_security_group_association" "app_nsg_association" {
+  network_interface_id      = azurerm_network_interface.app_server_nic.id
+  network_security_group_id = azurerm_network_security_group.appserver_nsg.id
+}
+
+# -----------------------------------------------------------------------------
+# Virtual Machine
+# Creates the application server with both internal and external SSH key access
+# -----------------------------------------------------------------------------
+resource "azurerm_linux_virtual_machine" "app_server" {
+  name                = "${local.prefix}-appserver"
+  resource_group_name = module.networking.resource_group_name
+  location            = module.networking.resource_group_location
+  size                = "Standard_D8s_v3"  # ARM-based VM
+  admin_username      = var.app_server_admin_username
+
+  # Configure both provided (external) and internal SSH keys
+  dynamic "admin_ssh_key" {
+    for_each = [
+      {
+        username   = var.app_server_admin_username
+        public_key = var.app_server_ssh_key  # External key for CI/CD access
+      },
+      {
+        username   = var.app_server_admin_username
+        public_key = tls_private_key.internal_key.public_key_openssh  # Internal key for infrastructure communication
+      }
+    ]
+    content {
+      username   = admin_ssh_key.value.username
+      public_key = admin_ssh_key.value.public_key
+    }
+  }
+
+  # Network interface configuration
+  network_interface_ids = [
+    azurerm_network_interface.app_server_nic.id
+  ]
+
+  # OS disk configuration
+  os_disk {
+    name                 = "${local.prefix}-appserver-os-disk"
+    caching              = "ReadWrite"
+    storage_account_type = "Premium_LRS"  # Premium SSD for better performance
+    disk_size_gb         = 64
+  }
+
+  # OS image configuration - RedHat Enterprise Linux
+source_image_reference {
+  publisher = "RedHat"
+  offer     = "RHEL"
+  sku       = "95_gen2"  # Changed from "9_5-lvm-gen2"
+  version   = "latest"
+}
+
+  # Initialize the app server with required software and configuration
+  custom_data = base64encode(file("${path.module}/userdata/appserver-init.sh"))
 
   tags = {
     Name          = "${local.prefix}-appserver-instance"
     ansible_group = "appserver"
   }
-
-  user_data = file("userdata/appserver-init.sh")
 }
 
-resource "aws_ebs_volume" "db_volume" {
-  availability_zone = aws_instance.app_server.availability_zone
-  size              = 100
+# -----------------------------------------------------------------------------
+# Database Storage
+# Creates and attaches a managed disk for database storage
+# -----------------------------------------------------------------------------
+resource "azurerm_managed_disk" "db_disk" {
+  name                 = "${local.prefix}-db-disk"
+  location            = module.networking.resource_group_location
+  resource_group_name = module.networking.resource_group_name
+  storage_account_type = "Premium_LRS"  # Premium SSD for database performance
+  create_option        = "Empty"
+  disk_size_gb         = 100
 
   tags = {
-    Name = "${local.prefix}-appserver-db-ebs"
+    Name = "${local.prefix}-appserver-db-disk"
   }
 }
 
-resource "aws_volume_attachment" "db_volume_attachment" {
-  device_name = "/dev/sdh"
-  instance_id = aws_instance.app_server.id
-  volume_id   = aws_ebs_volume.db_volume.id
+# -----------------------------------------------------------------------------
+# Database Disk Attachment
+# Attaches the database disk to the app server
+# -----------------------------------------------------------------------------
+resource "azurerm_virtual_machine_data_disk_attachment" "db_disk_attachment" {
+  managed_disk_id    = azurerm_managed_disk.db_disk.id
+  virtual_machine_id = azurerm_linux_virtual_machine.app_server.id
+  lun                = "10"  # Logical Unit Number for disk identification
+  caching            = "ReadWrite"
 }
 
-
-resource "aws_s3_bucket" "backup_bucket" {
-  bucket        = "${local.prefix}-backups"
-  force_destroy = false
-  tags = {
-    Name = "${local.prefix}-backups-bucket"
-  }
-}
-
-resource "aws_s3_bucket" "app_data" {
-  bucket        = "${local.prefix}-app-data"
-  force_destroy = true
-  tags = {
-    Name = "${local.prefix}-app-data-bucket"
-  }
-}
-
-# add a security group ingress and egress roule on port 443
-
-resource "aws_security_group" "appserver_sg" {
-  name        = "appserver_allow_tls"
-  description = "Allow HTTPS traffic inbound and all outbound traffic"
-  vpc_id      = module.networking.vpc_id
-
-  lifecycle {
-    create_before_destroy = true
-  }
+# -----------------------------------------------------------------------------
+# Storage Accounts
+# Creates storage accounts for backups and application data
+# -----------------------------------------------------------------------------
+# Storage Account for Backups
+resource "azurerm_storage_account" "backup_storage" {
+  name                     = replace("${local.prefix}backups", "-", "")
+  resource_group_name      = module.networking.resource_group_name
+  location                = module.networking.resource_group_location
+  account_tier            = "Standard"
+  account_replication_type = "GRS"  # Geo-redundant storage for backup safety
 
   tags = {
-    Name = "${local.prefix}-appserver-sg"
+    Name = "${local.prefix}-backups-storage"
   }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "appserver_allow_inbound_tls" {
-  security_group_id = aws_security_group.appserver_sg.id
-  ip_protocol       = "tcp"
-  from_port         = 443
-  to_port           = 443
-  cidr_ipv4         = "0.0.0.0/0"
+# Storage Account for Application Data
+resource "azurerm_storage_account" "app_data_storage" {
+  name                     = replace("${local.prefix}appdata", "-", "")
+  resource_group_name      = module.networking.resource_group_name
+  location                = module.networking.resource_group_location
+  account_tier            = "Standard"
+  account_replication_type = "LRS"  # Locally redundant storage for app data
+
   tags = {
-    Name = "${local.prefix}-allow-inbound-tls"
+    Name = "${local.prefix}-app-data-storage"
   }
 }
 
-resource "aws_vpc_security_group_egress_rule" "appserver_outbound_tls" {
-  security_group_id = aws_security_group.appserver_sg.id
-  ip_protocol       = -1
-  cidr_ipv4         = "0.0.0.0/0"
-  tags = {
-    Name = "${local.prefix}-allow-outbound-tls"
-  }
+# -----------------------------------------------------------------------------
+# Storage Containers
+# Creates containers within the storage accounts
+# -----------------------------------------------------------------------------
+resource "azurerm_storage_container" "backup_container" {
+  name                  = "backups"
+  storage_account_name  = azurerm_storage_account.backup_storage.name
+  container_access_type = "private"
 }
 
-resource "aws_vpc_security_group_ingress_rule" "appserver_internal_all_access" {
-  security_group_id            = aws_security_group.appserver_sg.id
-  ip_protocol                  = -1
-  referenced_security_group_id = data.aws_security_group.default.id
-  tags = {
-    Name = "${local.prefix}-allow-jumpbox-all-access"
-  }
+resource "azurerm_storage_container" "app_data_container" {
+  name                  = "appdata"
+  storage_account_name  = azurerm_storage_account.app_data_storage.name
+  container_access_type = "private"
 }
 
-resource "aws_vpc_security_group_ingress_rule" "appserver_internal_all_comms" {
-  security_group_id            = aws_security_group.appserver_sg.id
-  ip_protocol                  = -1
-  referenced_security_group_id = aws_security_group.appserver_sg.id
-  tags = {
-    Name = "${local.prefix}-allow-internal-all-access"
-  }
-}
+# -----------------------------------------------------------------------------
+# Application Gateway Backend Pool Association
+# Associates the app server with the Application Gateway backend pool
+# -----------------------------------------------------------------------------
+#resource "azurerm_app_configuration_key" "backend_pool" {
+#  configuration_store_id = azurerm_application_gateway.app_gateway.id
+#  key                   = "${local.prefix}-backend-pool"
+#  value                 = azurerm_network_interface.app_server_nic.private_ip_address
+#  
+#  depends_on = [
+#    azurerm_application_gateway.app_gateway,
+#    azurerm_network_interface.app_server_nic
+#  ]
+#}
 
-resource "aws_lb_target_group_attachment" "appserver_tga" {
-  target_group_arn = aws_lb_target_group.app_server_tg.arn
-  target_id        = aws_instance.app_server.id
-  port             = 80
-}
